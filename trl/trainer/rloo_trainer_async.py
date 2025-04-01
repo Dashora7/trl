@@ -104,8 +104,6 @@ class RLOOTrainerAsync(Trainer):
         #########
         # calculate various batch sizes
         #########
-        if args.total_episodes is None:  # allow the users to define episodes in terms of epochs.
-            args.total_episodes = int(args.num_train_epochs * self.train_dataset_len)
         accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
         self.accelerator = accelerator
         args.world_size = accelerator.num_processes
@@ -184,9 +182,13 @@ class RLOOTrainerAsync(Trainer):
             self.ref_policy = prepare_deepspeed(
                 self.ref_policy, args.per_device_train_batch_size, args.fp16, args.bf16
             )
+            self.model = prepare_deepspeed(
+                self.model, args.per_device_train_batch_size, args.fp16, args.bf16
+            )
             self.deepspeed = self.model
         else:
-            self.ref_policy = self.ref_policy.to(self.accelerator.device)
+            self.ref_policy = self.accelerator.prepare(self.ref_policy)
+            self.model = self.accelerator.prepare(self.model)
 
     def train(self):
         args = self.args
@@ -200,9 +202,11 @@ class RLOOTrainerAsync(Trainer):
 
         def repeat_generator():
             while True:
-                if len(self.replay_buffer.storage) >= args.batch_size:
-                    batch = ray.get(self.replay_buffer.pop_all(args.batch_size))
-                    yield batch
+                curr_batch = []
+                for _ in range(args.batch_size):
+                    item = self.replay_buffer.get(block=True)
+                    curr_batch.append(item)
+                yield curr_batch
 
         iter_dataloader = iter(repeat_generator())
 
@@ -221,7 +225,6 @@ class RLOOTrainerAsync(Trainer):
         self.state.global_step = 0
         self.state.episode = 0
         self.state.max_steps = (args.num_total_batches * args.num_mini_batches) // 2
-        self.state.num_train_epochs = args.total_episodes / self.train_dataset_len
         # Compute absolute values for logging, eval, and save if given as ratio
         if args.logging_steps is not None:
             if args.logging_steps < 1:
@@ -246,19 +249,23 @@ class RLOOTrainerAsync(Trainer):
             with torch.no_grad():
                 queries_text = [traj["prompt"] for traj in data]
                 queries = processing_class.batch_encode_plus(queries_text, return_tensors="pt", padding=True).to(device)
+                queries = queries["input_ids"]
                 responses_text = [traj["response"] for traj in data]
                 responses = processing_class.batch_encode_plus(responses_text, return_tensors="pt", padding=True).to(device)
+                responses = responses["input_ids"]
                 scores = [traj["reward"] for traj in data]
                 old_logprobs = [traj["old_logprobs"] for traj in data]
 
                 context_length = queries.shape[1]
+                local_batch_size = queries.shape[0]
                 postprocessed_responses = []
                 logprobs = []
                 ref_logprobs = []
                 sequence_lengths = []
+                query_responses = []
 
                 # Process responses in batches
-                for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
+                for i in range(0, local_batch_size, args.local_rollout_forward_batch_size):
                     query = queries[i : i + args.local_rollout_forward_batch_size]
                     response = responses[i : i + args.local_rollout_forward_batch_size]
                     query_response = torch.cat((query, response), 1)
@@ -271,10 +278,10 @@ class RLOOTrainerAsync(Trainer):
                         torch.cuda.empty_cache()
 
                     with torch.no_grad():
-                        ref_output = forward(ref_policy, query_response, processing_class.pad_token_id).logits[:, context_length - 1 : -1]
+                        ref_logits = forward(ref_policy, query_response, processing_class.pad_token_id).logits[:, context_length - 1 : -1]
                         ref_logits /= args.temperature + 1e-7
                         ref_logprob = selective_log_softmax(ref_logits, response)
-                        del ref_output, ref_logits
+                        del ref_logits
                         torch.cuda.empty_cache()
 
                     # Response Processing 1. truncate response after the first occurrence of `stop_token_id`
@@ -290,15 +297,15 @@ class RLOOTrainerAsync(Trainer):
                     logprobs.append(logprob)
                     ref_logprobs.append(ref_logprob)
                     sequence_lengths.append(sequence_length)
-                
+                    query_responses.append(query_response)
                 # Concatenate all batched results
-                responses = torch.cat(responses, 0)
                 postprocessed_responses = torch.cat(postprocessed_responses, 0)
                 logprobs = torch.cat(logprobs, 0)
                 ref_logprobs = torch.cat(ref_logprobs, 0)
                 sequence_lengths = torch.cat(sequence_lengths, 0)
-                scores = torch.cat(scores, 0)
-                del (logprob, ref_logprob, score)
+                query_responses = torch.cat(query_responses, 0)
+                scores = torch.tensor(scores, device=logprobs.device)
+                del (logprob, ref_logprob)
                 torch.cuda.empty_cache()
                 gc.collect()
 
@@ -452,7 +459,7 @@ class RLOOTrainerAsync(Trainer):
                 metrics["val/num_eos_tokens"] = (responses == processing_class.eos_token_id).sum().item()
                 metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
                 metrics["episode"] = self.state.episode
-                self.state.epoch = self.state.episode / (args.rloo_k * self.train_dataset_len)  # used by self.log
+                self.state.epoch = self.state.episode / self.local_dataloader_batch_size
                 self.log(metrics)
             del kl, mean_kl, mean_entropy, scores
 
