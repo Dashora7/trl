@@ -261,7 +261,7 @@ class RLOOTrainerAsync(Trainer):
                 responses = processing_class.batch_encode_plus(responses_text, return_tensors="pt", padding=True).to(device)
                 responses = responses["input_ids"]
                 scores = [traj["reward"] for traj in data]
-                old_logprobs = [traj["old_logprobs"] for traj in data]
+                vllm_logprobs = [traj["logprobs"] for traj in data]
 
                 context_length = queries.shape[1]
                 local_batch_size = queries.shape[0]
@@ -277,6 +277,7 @@ class RLOOTrainerAsync(Trainer):
                     response = responses[i : i + args.local_rollout_forward_batch_size]
                     query_response = torch.cat((query, response), 1)
 
+                    # recalculating the logprobs instead of using the vllm logprobs
                     with torch.no_grad():
                         logits = forward(model, query_response, processing_class.pad_token_id).logits[:, context_length - 1 : -1]
                         logits /= args.temperature + 1e-7
