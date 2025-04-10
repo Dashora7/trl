@@ -80,7 +80,7 @@ class VLLMClient:
     """
 
     def __init__(
-        self, host: str = "0.0.0.0", server_port: int = 8000, group_port: int = 51216, connection_timeout: float = 0.0
+        self, host: str = "0.0.0.0", server_port: int = 8000, group_port: int = 51216, connection_timeout: float = 0.0, init_comm: bool = True
     ):
         if not is_requests_available():
             raise ImportError("requests is not installed. Please install it with `pip install requests`.")
@@ -91,8 +91,12 @@ class VLLMClient:
         self.host = host
         self.server_port = server_port
         self.group_port = group_port
+        self.init_comm = init_comm
         self.check_server(connection_timeout)  # check server and fail after timeout
-        self.init_communicator()
+        # Only initialize communicator if specifically requested
+        if self.init_comm:
+            self.init_communicator()
+            
         atexit.register(self.close_communicator)  # when the client object is deleted, close the weight update group
 
     def check_server(self, total_timeout: float = 0.0, retry_interval: float = 2.0):
