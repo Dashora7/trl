@@ -74,6 +74,7 @@ class RLOOTrainerAsync(Trainer):
         # less commonly used
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         callbacks: Optional[list[TrainerCallback]] = None,
+        async_replay_buffer: bool = True,
     ) -> None:
         if ref_policy is policy:
             raise ValueError(
@@ -86,6 +87,7 @@ class RLOOTrainerAsync(Trainer):
         self.processing_class = processing_class
         self.policy = policy
         self.replay_buffer = replay_buffer
+        self.async_replay_buffer = async_replay_buffer
 
         # Define the collator if not provided
         if data_collator is None:
@@ -201,10 +203,15 @@ class RLOOTrainerAsync(Trainer):
         device = accelerator.device
 
         def repeat_generator():
+            if not self.async_replay_buffer:
+                iter = self.replay_buffer.run()
             while True:
                 curr_batch = []
                 for _ in range(args.batch_size):
-                    item = self.replay_buffer.get(block=True)
+                    if self.async_replay_buffer:
+                        item = self.replay_buffer.get(block=True)
+                    else:
+                        item = next(iter)
                     curr_batch.append(item)
                 yield curr_batch
 
@@ -254,7 +261,7 @@ class RLOOTrainerAsync(Trainer):
                 responses = processing_class.batch_encode_plus(responses_text, return_tensors="pt", padding=True).to(device)
                 responses = responses["input_ids"]
                 scores = [traj["reward"] for traj in data]
-                old_logprobs = [traj["old_logprobs"] for traj in data]
+                vllm_logprobs = [traj["logprobs"] for traj in data]
 
                 context_length = queries.shape[1]
                 local_batch_size = queries.shape[0]
@@ -270,6 +277,7 @@ class RLOOTrainerAsync(Trainer):
                     response = responses[i : i + args.local_rollout_forward_batch_size]
                     query_response = torch.cat((query, response), 1)
 
+                    # recalculating the logprobs instead of using the vllm logprobs
                     with torch.no_grad():
                         logits = forward(model, query_response, processing_class.pad_token_id).logits[:, context_length - 1 : -1]
                         logits /= args.temperature + 1e-7
