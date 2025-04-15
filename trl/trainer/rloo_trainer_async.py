@@ -254,6 +254,8 @@ class RLOOTrainerAsync(Trainer):
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
             with torch.no_grad():
+                # Flatten all turns from all trajectories into a single list
+                data = [turn for traj in data for turn in (traj if isinstance(traj, list) else [traj])]
                 queries_text = [traj["prompt"] for traj in data]
                 queries = processing_class.batch_encode_plus(queries_text, return_tensors="pt", padding=True).to(device)
                 queries = queries["input_ids"]
@@ -442,6 +444,8 @@ class RLOOTrainerAsync(Trainer):
                     # fmt: on
                     torch.cuda.empty_cache()
 
+            # TODO: update weights of vllm
+                    
             # Compute metrics
             with torch.no_grad():
                 mean_kl = kl.sum(1).mean()
