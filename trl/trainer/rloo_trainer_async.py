@@ -263,7 +263,7 @@ class RLOOTrainerAsync(Trainer):
                 responses = processing_class.batch_encode_plus(responses_text, return_tensors="pt", padding=True).to(device)
                 responses = responses["input_ids"]
                 scores = [traj["reward"] for traj in data]
-                vllm_logprobs = [traj["logprobs"] for traj in data]
+                # vllm_logprobs = [traj["logprobs"] for traj in data]
 
                 context_length = queries.shape[1]
                 local_batch_size = queries.shape[0]
