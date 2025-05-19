@@ -197,7 +197,6 @@ class RLOOTrainerAsync(Trainer):
         accelerator = self.accelerator
         optimizer = self.optimizer
         model = self.model
-        self.model_wrapped = self.model
         ref_policy = self.ref_policy
         processing_class = self.processing_class
         device = accelerator.device
@@ -254,108 +253,134 @@ class RLOOTrainerAsync(Trainer):
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
             with torch.no_grad():
-                # Flatten all turns from all trajectories into a single list
-                data = [turn for traj in data for turn in (traj if isinstance(traj, list) else [traj])]
-                queries_text = [traj["prompt"] for traj in data]
-                queries = processing_class.batch_encode_plus(queries_text, return_tensors="pt", padding=True).to(device)
-                queries = queries["input_ids"]
-                responses_text = [traj["response"] for traj in data]
-                responses = processing_class.batch_encode_plus(responses_text, return_tensors="pt", padding=True).to(device)
-                responses = responses["input_ids"]
-                scores = [traj["reward"] for traj in data]
-                # vllm_logprobs = [traj["logprobs"] for traj in data]
-
-                context_length = queries.shape[1]
-                local_batch_size = queries.shape[0]
-                postprocessed_responses = []
-                logprobs = []
-                ref_logprobs = []
-                sequence_lengths = []
-                query_responses = []
-
-                # Process responses in batches
-                for i in range(0, local_batch_size, args.local_rollout_forward_batch_size):
-                    query = queries[i : i + args.local_rollout_forward_batch_size]
-                    response = responses[i : i + args.local_rollout_forward_batch_size]
-                    query_response = torch.cat((query, response), 1)
-
-                    # recalculating the logprobs instead of using the vllm logprobs
-                    with torch.no_grad():
-                        logits = forward(model, query_response, processing_class.pad_token_id).logits[:, context_length - 1 : -1]
-                        logits /= args.temperature + 1e-7
-                        logprob = selective_log_softmax(logits, response)
-                        del logits
-                        torch.cuda.empty_cache()
-
-                    with torch.no_grad():
-                        ref_logits = forward(ref_policy, query_response, processing_class.pad_token_id).logits[:, context_length - 1 : -1]
-                        ref_logits /= args.temperature + 1e-7
-                        ref_logprob = selective_log_softmax(ref_logits, response)
-                        del ref_logits
-                        torch.cuda.empty_cache()
-
-                    # Response Processing 1. truncate response after the first occurrence of `stop_token_id`
-                    postprocessed_response = response
-                    if args.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
-                        postprocessed_response = truncate_response(
-                            args.stop_token_id, processing_class.pad_token_id, response
-                        )
-                    sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
-
-                    # Store batch results
-                    postprocessed_responses.append(postprocessed_response)
-                    logprobs.append(logprob)
-                    ref_logprobs.append(ref_logprob)
-                    sequence_lengths.append(sequence_length)
-                    query_responses.append(query_response)
-                # Concatenate all batched results
-                postprocessed_responses = torch.cat(postprocessed_responses, 0)
-                logprobs = torch.cat(logprobs, 0)
-                ref_logprobs = torch.cat(ref_logprobs, 0)
-                sequence_lengths = torch.cat(sequence_lengths, 0)
-                query_responses = torch.cat(query_responses, 0)
-                scores = torch.tensor(scores, device=logprobs.device)
-                del (logprob, ref_logprob)
-                torch.cuda.empty_cache()
-                gc.collect()
-
-                # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
-                response_idxs = torch.arange(responses.shape[1], device=responses.device).repeat(responses.shape[0], 1)
-                padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
-                logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
-                ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
-
-                # 4. compute rewards
-                # Compute KL divergence
+                # Process each conversation trajectory
+                all_input_ids = []
+                all_response_masks = []
+                all_rewards = []
+                
+                for traj in data:
+                    turns = traj if isinstance(traj, list) else [traj]
+                    if not turns:
+                        continue
+                        
+                    # Get the reward for the entire conversation TODO: deal with multiple rewards
+                    conversation_reward = turns[-1]["reward"]
+                    
+                    # Build the full conversation sequence in token space
+                    full_sequence_tokens = []
+                    response_mask = []  # 1 for response tokens, 0 for prompt tokens
+                    
+                    for turn in turns:
+                        # Tokenize prompt and response separately
+                        prompt_tokens = processing_class.encode(turn["prompt"])
+                        response_tokens = processing_class.encode(turn["response"])
+                        
+                        # Add prompt tokens to sequence with mask=0 (not a response)
+                        full_sequence_tokens.extend(prompt_tokens)
+                        response_mask.extend([0] * len(prompt_tokens))
+                        
+                        # Add response tokens to sequence with mask=1 (is a response)
+                        full_sequence_tokens.extend(response_tokens)
+                        response_mask.extend([1] * len(response_tokens))
+                    
+                    all_input_ids.append(full_sequence_tokens)
+                    all_response_masks.append(response_mask)
+                    all_rewards.append(conversation_reward)
+                
+                # Pad sequences to the same length
+                max_length = max(len(seq) for seq in all_input_ids)
+                padded_input_ids = []
+                padded_masks = []
+                
+                for i, (seq, mask) in enumerate(zip(all_input_ids, all_response_masks)):
+                    # Pad with pad_token_id
+                    padded_seq = seq + [processing_class.pad_token_id] * (max_length - len(seq))
+                    padded_mask = mask + [0] * (max_length - len(mask))  # Pad masks with 0
+                    
+                    padded_input_ids.append(padded_seq)
+                    padded_masks.append(padded_mask)
+                
+                # Convert to tensors
+                input_ids = torch.tensor(padded_input_ids, device=device)
+                response_masks = torch.tensor(padded_masks, dtype=torch.bool, device=device)
+                rewards = torch.tensor(all_rewards, device=device)
+                
+                # Forward pass through both models
+                with torch.no_grad():
+                    outputs = forward(model, input_ids, processing_class.pad_token_id)
+                    ref_outputs = forward(ref_policy, input_ids, processing_class.pad_token_id)
+                
+                logits = outputs.logits[:, :-1]  # Shift to align with next tokens
+                ref_logits = ref_outputs.logits[:, :-1]
+                
+                # Prepare target tokens (shifted right for next-token prediction)
+                target_ids = input_ids[:, 1:]
+                response_masks_shifted = response_masks[:, 1:]  # Shift mask to match
+                
+                # Create a tensor for logprobs of the right shape
+                batch_size = input_ids.shape[0]
+                seq_length = target_ids.shape[1]
+                
+                # Calculate logprobs only for response tokens
+                logprobs = torch.full((batch_size, seq_length), INVALID_LOGPROB, device=device, dtype=torch.float)
+                ref_logprobs = torch.full((batch_size, seq_length), INVALID_LOGPROB, device=device, dtype=torch.float)
+                
+                # We need to efficiently compute logprobs for all tokens
+                for i in range(batch_size):
+                    # Get logprobs for all positions where we have a response token
+                    mask = response_masks_shifted[i]
+                    if not mask.any():
+                        continue
+                    
+                    # Get the logits and target ids for this sequence where responses are
+                    seq_logits = logits[i][mask]
+                    seq_ref_logits = ref_logits[i][mask]
+                    seq_targets = target_ids[i][mask]
+                    
+                    # Compute log probabilities for response tokens
+                    seq_logprobs = selective_log_softmax(seq_logits, seq_targets)
+                    seq_ref_logprobs = selective_log_softmax(seq_ref_logits, seq_targets)
+                    
+                    # Place logprobs in the right positions
+                    logprobs[i][mask] = seq_logprobs.flatten()
+                    ref_logprobs[i][mask] = seq_ref_logprobs.flatten()
+                
+                # Compute KL divergence on response tokens
                 kl = logprobs - ref_logprobs
-
-                # Normalize rewards
+                
+                # Normalize rewards if needed
                 if args.normalize_reward:
-                    scores = (scores - scores.mean()) / (scores.std() + 1e-8)
-                    scores = torch.clamp(scores, -args.reward_clip_range, args.reward_clip_range)
-
-                # Compute total reward with KL penalty
+                    rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+                    rewards = torch.clamp(rewards, -args.reward_clip_range, args.reward_clip_range)
+                    
+                # Compute rewards with KL penalty
                 if args.token_level_kl:
-                    # Token-level KL penalty: apply KL penalty per token
+                    # Token-level KL penalty applied to response tokens only
                     kl_reward = -args.kl_coef * kl
-
-                    # Get the index of the last non-padded token for each sequence
-                    eos_indices = padding_mask.size(1) - 1 - padding_mask.long().fliplr().argmax(dim=1, keepdim=True)
+                    
+                    # Get the last response token for each conversation
+                    last_indices = []
+                    for i in range(batch_size):
+                        # Find the last position where response_mask is True
+                        last_true = response_masks_shifted[i].nonzero()
+                        last_idx = last_true[-1] if last_true.numel() > 0 else 0
+                        last_indices.append(last_idx.item())
+                    
+                    # Create tensor for final rewards
                     last_reward = torch.zeros_like(kl)
-                    # Ensure scores has correct shape and type
-                    scores_shaped = scores.reshape(-1, 1).to(kl.dtype)
-                    last_reward.scatter_(dim=1, index=eos_indices, src=scores_shaped)
-
-                    # Combine KL reward and last reward
-                    non_score_reward = kl_reward.sum(1)  # Keep this for logging
+                    for i in range(batch_size):
+                        last_reward[i, last_indices[i]] = rewards[i]
+                    
+                    # Combine KL reward and final reward
+                    non_score_reward = torch.sum(kl_reward * response_masks_shifted.float(), dim=1)
                     reward = last_reward + kl_reward
-                    rlhf_reward = reward.sum(1)  # Sum across sequence length
+                    rlhf_reward = torch.sum(reward * response_masks_shifted.float(), dim=1)
                 else:
-                    # Sequence-level KL penalty: sum KL across tokens first
-                    sequence_kl = kl.sum(1)
+                    # Sequence-level KL penalty
+                    sequence_kl = torch.sum(kl * response_masks_shifted.float(), dim=1)
                     non_score_reward = -args.kl_coef * sequence_kl
-                    rlhf_reward = non_score_reward + scores
-
+                    rlhf_reward = non_score_reward + rewards
+                
                 # vectorized RLOO advantages implementation
                 rlhf_reward = rlhf_reward.reshape(args.rloo_k, -1)
                 baseline = (rlhf_reward.sum(0) - rlhf_reward) / (args.rloo_k - 1)
@@ -383,28 +408,46 @@ class RLOOTrainerAsync(Trainer):
 
                             # Get batch data
                             mb_advantage = advantages[micro_batch_inds]
-                            mb_responses = responses[micro_batch_inds]
-                            mb_query_responses = query_responses[micro_batch_inds]
+                            mb_input_ids = input_ids[micro_batch_inds]
+                            mb_response_masks = response_masks_shifted[micro_batch_inds]  # Get shifted response masks
                             mb_logprobs = logprobs[micro_batch_inds]
+                            mb_target_ids = target_ids[micro_batch_inds]
 
                             # Forward pass
-                            output = forward(model, mb_query_responses, processing_class.pad_token_id)
-                            logits = output.logits[:, context_length - 1 : -1]
+                            output = forward(model, mb_input_ids, processing_class.pad_token_id)
+                            logits = output.logits[:, :-1]  # Shift to align with targets
                             logits /= args.temperature + 1e-7
 
-                            # Compute new logprobs
-                            new_logprobs = selective_log_softmax(logits, mb_responses)
-                            new_logprobs = torch.masked_fill(
-                                new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
-                            )
-
-                            # Compute probability ratios
-                            new_ratio = (new_logprobs - mb_logprobs).exp()
-                            new_logprobs = new_logprobs.sum(1)
-                            mb_logprobs = mb_logprobs.sum(1)
-                            logprobs_diff = new_logprobs - mb_logprobs
+                            # Compute new logprobs only for response tokens
+                            new_logprobs_full = torch.full_like(mb_logprobs, INVALID_LOGPROB)
+                            
+                            # Calculate logprobs only where response masks are True
+                            for i in range(mb_input_ids.shape[0]):
+                                mask = mb_response_masks[i]
+                                if not mask.any():
+                                    continue
+                                    
+                                seq_logits = logits[i][mask]
+                                seq_targets = mb_target_ids[i][mask]
+                                
+                                # Compute log probabilities for response tokens
+                                seq_logprobs = selective_log_softmax(seq_logits, seq_targets)
+                                
+                                # Place logprobs in the right positions
+                                new_logprobs_full[i][mask] = seq_logprobs.flatten()
+                            
+                            # Only use response tokens for ratio calculation
+                            # Sum logprobs across sequence dimension but only for response tokens
+                            mb_logprobs_sum = torch.sum(mb_logprobs * mb_response_masks.float(), dim=1)
+                            new_logprobs_sum = torch.sum(new_logprobs_full * mb_response_masks.float(), dim=1)
+                            
+                            # Compute log ratio
+                            logprobs_diff = new_logprobs_sum - mb_logprobs_sum
                             ratio = torch.exp(logprobs_diff)
-
+                            
+                            # Compute token-wise ratios for metrics
+                            token_ratio = (new_logprobs_full - mb_logprobs).exp()
+                            
                             # PPO clipped loss
                             pg_losses = -mb_advantage * ratio
                             pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
@@ -421,25 +464,39 @@ class RLOOTrainerAsync(Trainer):
 
                             with torch.no_grad():
                                 pg_clipfrac = (pg_losses2 > pg_losses).float().mean()
-                                prob_dist = torch.nn.functional.softmax(logits, dim=-1)
-                                entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
+                                
+                                # Entropy calculation (only for response tokens)
+                                entropy = torch.zeros_like(new_logprobs_full)
+                                for i in range(mb_input_ids.shape[0]):
+                                    mask = mb_response_masks[i]
+                                    if not mask.any():
+                                        continue
+                                        
+                                    seq_logits = logits[i][mask]
+                                    prob_dist = torch.nn.functional.softmax(seq_logits, dim=-1)
+                                    seq_entropy = torch.logsumexp(seq_logits, dim=-1) - torch.sum(prob_dist * seq_logits, dim=-1)
+                                    entropy[i][mask] = seq_entropy
+                                
+                                # Average entropy only over response tokens
+                                mean_entropy = torch.sum(entropy * mb_response_masks.float()) / (mb_response_masks.sum() + 1e-8)
+                                
                                 approxkl = 0.5 * (logprobs_diff**2).mean()
                                 approxkl_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
-                                pg_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = (
-                                    pg_clipfrac
-                                )
+                                pg_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_clipfrac
                                 pg_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_loss
-                                entropy_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
-                                ratio_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = new_ratio.mean()
+                                entropy_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = mean_entropy
+                                ratio_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = token_ratio[mb_response_masks].mean()
+                        
                         gradient_accumulation_idx += 1
                     minibatch_idx += 1
 
                     # del everything and empty cache
                     # fmt: off
                     del (
-                        output, logits, new_logprobs, logprobs_diff, ratio, pg_losses,
-                        pg_losses2, pg_loss, loss, pg_clipfrac, prob_dist, entropy, approxkl,
-                        mb_advantage, mb_responses, mb_query_responses, mb_logprobs,
+                        output, logits, new_logprobs_full, logprobs_diff, ratio, pg_losses,
+                        pg_losses2, pg_loss, loss, pg_clipfrac, entropy, approxkl,
+                        mb_advantage, mb_input_ids, mb_response_masks, mb_logprobs, mb_target_ids,
+                        token_ratio
                     )
                     # fmt: on
                     torch.cuda.empty_cache()
@@ -460,7 +517,7 @@ class RLOOTrainerAsync(Trainer):
                     self.accelerator.gather_for_metrics(mean_non_score_reward).mean().item()
                 )
                 metrics["objective/rlhf_reward"] = self.accelerator.gather_for_metrics(rlhf_reward).mean().item()
-                metrics["objective/scores"] = self.accelerator.gather_for_metrics(scores.mean()).mean().item()
+                metrics["objective/scores"] = self.accelerator.gather_for_metrics(rewards.mean()).mean().item()
                 metrics["policy/approxkl_avg"] = self.accelerator.gather_for_metrics(approxkl_stats).mean().item()
                 metrics["policy/clipfrac_avg"] = self.accelerator.gather_for_metrics(pg_clipfrac_stats).mean().item()
                 metrics["loss/policy_avg"] = self.accelerator.gather_for_metrics(pg_loss_stats).mean().item()
@@ -468,12 +525,12 @@ class RLOOTrainerAsync(Trainer):
                 metrics["policy/entropy_avg"] = self.accelerator.gather_for_metrics(entropy_stats).mean().item()
                 metrics["val/ratio"] = self.accelerator.gather_for_metrics(ratio_stats).mean().item()
                 metrics["val/ratio_var"] = self.accelerator.gather_for_metrics(ratio_stats).var().item()
-                metrics["val/num_eos_tokens"] = (responses == processing_class.eos_token_id).sum().item()
+                metrics["val/num_eos_tokens"] = (input_ids == processing_class.eos_token_id).sum().item()
                 metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
                 metrics["episode"] = self.state.episode
                 self.state.epoch = self.state.episode / self.local_dataloader_batch_size
                 self.log(metrics)
-            del kl, mean_kl, mean_entropy, scores
+            del kl, mean_kl, mean_entropy, rewards
 
             self.lr_scheduler.step()
             self.state.global_step += 1
