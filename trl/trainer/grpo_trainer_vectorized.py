@@ -207,13 +207,13 @@ class GRPOTrainerVectorized(GRPOTrainer):
         # completions may be distributed across processes
         rewards = gather(rewards)
         
-        # Compute grouped-wise rewards
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+        # Compute grouped-wise rewards. TODO: this is not correct, because the rewards are not normalized per group
+        mean_grouped_rewards = rewards.view(-1, num_trajectories).mean(dim=1)
+        std_grouped_rewards = rewards.view(-1, num_trajectories).std(dim=1)
 
         # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_trajectories, dim=0)
+        std_grouped_rewards = std_grouped_rewards.repeat_interleave(num_trajectories, dim=0)
         advantages = rewards - mean_grouped_rewards
         if self.scale_rewards:
             advantages = advantages / (std_grouped_rewards + 1e-4)
